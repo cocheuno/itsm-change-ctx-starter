@@ -112,3 +112,30 @@ Optional fields:
 Then run `python classify.py RFC-9999`.
 
 If the RFC is malformed (missing required field, wrong type, invalid date), the agent fails loudly at intake — schema validation runs before any reasoning.
+
+## 9. Generate a synthetic RFC corpus
+
+For stress-testing the agent at scale, `tools/synth.py` produces schema-valid RFCs that reference the existing CMDB. Output is gitignored and lives at `data/synthetic/rfcs.json` by default.
+
+```bash
+python -m tools.synth --rfcs 100 --seed 42
+```
+
+Flags:
+
+- `--rfcs N` — number of RFCs to generate (default 50)
+- `--seed N` — random seed (default 0). Same seed produces the same corpus.
+- `--out PATH` — output file (default `data/synthetic/rfcs.json`)
+- `--cmdb PATH` — CMDB to draw CIs from (default `data/cmdb.json`)
+
+Generated IDs start at `RFC-1000000` so they can never collide with the hand-crafted `RFC-99XX` range. Distributions (one vs. multi-CI, emergency rate, planned-start coverage, title patterns) are tuned for a realistic mix of outcomes — auto-approve, CAB review, refused, and the occasional emergency.
+
+Classify a generated RFC the same way as a hand-crafted one:
+
+```bash
+python classify.py RFC-1000007
+```
+
+Note: `classify.py` reads from `data/rfcs.json`, not `data/synthetic/rfcs.json`. To run the agent over the synthetic corpus, either copy the entries you want into `data/rfcs.json`, or load and classify them programmatically (see `tests/test_synthetic.py` for an example).
+
+This is Step 1 of the data-realism upgrade roadmap from `AGENT_PRIMER.md`. Future steps add adversarial inputs, stochastic CMDB drift, and an eval-runner that turns the corpus into metrics.
