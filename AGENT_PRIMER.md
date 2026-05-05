@@ -180,13 +180,43 @@ The decision is final, the trace is complete, and the entry has been appended to
 
 **Why this scenario is pedagogically interesting.** If the freeze rule had checked `submitted_at` instead of `planned_start_at`, this RFC would have **auto-approved** (April 21 is before the freeze starts). The same change would then have executed during a freeze window in violation of policy. The lesson: *the model your rule consults must match the real-world timestamp the policy actually keys on*.
 
-### 9. What this isn't (deliberately)
+### 9. How natural-language output is generated
+
+You may have noticed the agent produces prose — refusal reasons, decision explanations, trace action labels. Where does it come from? Plain Python f-strings, in the layer modules. There is no template engine, no NLG library, and **no LLM in the loop**.
+
+Each rule that fires has its own message format embedded in the rule's code:
+
+- **DORA override** (`agent/rules.py:102`):
+  `f"Service {service['id']} ({service['name']}) is DORA-regulated. All changes to this service require CAB review."`
+- **Stale-edge refusal** (`agent/harness.py:_first_unreliable`):
+  `f"CI {a['ci_id']} -> service mapping is {a['age_days']} days old (threshold: {config.MAX_EDGE_AGE_DAYS}). Refusing to act on stale context."`
+- **Freeze window** (`agent/harness.py:_decide`):
+  `f"{field_label} ({fw['checked_at']}) falls in freeze window: {fw['window']}."`
+
+The **pre-brief** that goes to the CAB is *structured*, not prose. `_build_pre_brief()` in `agent/harness.py` returns a dict with keys like `service`, `service_tier`, `dora_regulated`, `template_match`, `prior_changes`, `downstream_triggers`. A human reading the JSON output sees data, not a memo.
+
+This design buys four properties:
+
+- **Predictable.** Same input always produces the same message, byte-for-byte. The prompt-injection adversarial test in `tests/test_adversarial.py` depends on this.
+- **Testable.** Assertions like `assert "freeze" in decision["reason"].lower()` work because the strings are deterministic.
+- **Groundable.** Every value in a message comes from a structured source (a config knob, a CMDB edge, a freeze-window record). No invention.
+- **Auditable.** No hallucination risk.
+
+The trade-off: the prose reads like a canned template, because it *is* a canned template. It does not adapt tone, weave context together fluently, or summarize multiple findings into one paragraph. A real CAB reviewer might prefer something like:
+
+> *This change affects `internal-dashboard`, a non-DORA service. The standard cert-rotation template applies, but planned execution falls inside the spring patch freeze (April 23–25), so it routes to CAB review.*
+
+That sentence is exactly what an LLM would produce well. Generating it is the cleanest first place to slot in an LLM in this architecture: feed `_build_pre_brief()`'s structured dict to a model with a constrained-output prompt and let it render the paragraph. The dict stays authoritative; the model only translates. The agent's verdict is unaffected.
+
+That upgrade — *Pre-brief generation* — appears in Part II's LLM integration section. It is the lowest-friction LLM integration available because it does not change the decision pipeline at all; it wraps prose around a decision the deterministic agent already made.
+
+### 10. What this isn't (deliberately)
 
 To keep the lab tractable for a single laptop, several real-world concerns are stubbed:
 
 - No LLM. The reasoning is plain Python.
 - No database. CMDB, services, templates, history, and freeze windows are all JSON files.
-- No real-time data sync. The CMDB graph is built once at module load and never refreshed.
+- No real-time data sync. The CMDB graph is built once and cached as a singleton; `relationships.invalidate_graph()` is the explicit hook a production system would call from a CMDB-update event handler, but no such handler is wired here.
 - No multi-tenant or RBAC. Everyone sees everyone's RFCs.
 - No concurrency. One process, one classification at a time.
 
@@ -200,11 +230,13 @@ The list is grouped by what kind of realism each upgrade buys. None are required
 
 ### Data realism
 
-- **Synthetic data generation.** Replace the seven hand-crafted RFCs with a generator that produces realistic distributions: a long tail of routine changes, a thin head of unusual ones, edge cases that should refuse, deliberately ambiguous cases that should escalate. Tools: `faker` for names/timestamps, custom samplers for service/template combinations. Useful for stress-testing classifications and for surfacing classes of RFC the policy did not anticipate.
-- **Adversarial test cases.** Malformed RFCs, prompt-injection strings stuffed into the description field (to verify the agent really does ignore it), conflicting CIs (two CIs that map to incompatible services), submitted-at timestamps in the future. Each should produce a clean refusal or schema-validation failure, never a confident wrong answer.
-- **Larger CMDB.** Today there are seven CIs and five services. Scale to thousands of each, with realistic dependency density (a few highly-connected hubs, a long tail of leaves). Many performance and correctness bugs only show up at this scale.
-- **Stochastic CMDB drift.** Have `last_verified_at` ages drift over time so the freshness rule actually exercises. Today every edge is fresh except the deliberately-stale `fraud-check` one.
-- **Anonymized real-world data.** If you have access to anonymized ITSM extracts, replay them through the agent and compare against the CAB's actual decisions. This is how you discover where your policy and reality diverge.
+> Items 1–4 below are now implemented in `tools/synth.py`; the property tests live in `tests/test_synthetic.py`, `tests/test_synthetic_cmdb.py`, and `tests/test_adversarial.py`. The descriptions explain *why* each upgrade matters, which is the part students should still understand even when the code already exists.
+
+- **Synthetic data generation.** Replace the seven hand-crafted RFCs with a generator that produces realistic distributions: a long tail of routine changes, a thin head of unusual ones, edge cases that should refuse, deliberately ambiguous cases that should escalate. Useful for stress-testing classifications and for surfacing classes of RFC the policy did not anticipate. *(Implemented: `tools/synth.py:generate_rfcs`, CLI `python -m tools.synth --rfcs N --seed N`.)*
+- **Adversarial test cases.** Malformed RFCs, prompt-injection strings stuffed into the description field (to verify the agent really does ignore it), unknown CIs, future-dated submissions. Each should produce a clean refusal or schema-validation failure, never a confident wrong answer. *(Implemented: `tools/synth.py:generate_malformed_rfcs / generate_unknown_ci_rfcs / generate_prompt_injection_pairs`. The prompt-injection pairs make the description-untrusted boundary an enforced contract: `classify(clean) == classify(hostile)` byte-for-byte.)*
+- **Larger CMDB.** Scale from seven CIs and five services to thirty or hundreds, with realistic dependency density. Many performance and correctness bugs only show up at scale. *(Implemented: `tools/synth.py:generate_services / generate_cmdb`, `--corpus` CLI mode.)*
+- **Stochastic CMDB drift.** Have `last_verified_at` ages follow a realistic distribution — most edges fresh, a long tail going stale — so the freshness rule actually exercises across the corpus, not only on the hand-crafted RFC-9903. *(Implemented: `_draw_freshness` produces ~70% fresh / ~25% borderline straddling the 30-day threshold / ~5% stale; the property test in `tests/test_synthetic_cmdb.py` asserts the rule fires on some-but-not-all RFCs.)*
+- **Anonymized real-world data.** If you have access to anonymized ITSM extracts, replay them through the agent and compare against the CAB's actual decisions. This is how you discover where your policy and reality diverge. *(Future.)*
 
 ### Storage and infrastructure
 
@@ -212,7 +244,7 @@ The list is grouped by what kind of realism each upgrade buys. None are required
 - **Event store for audit.** Replace `data/audit_log.jsonl` with Kafka or an append-only Postgres table. You get partitioning, retention policies, replay, and crash safety, none of which a JSONL file gives you.
 - **Embeddings for template matching.** Today `match_template()` does keyword overlap. Replace it with an embedding model (OpenAI, Cohere, or a local sentence-transformer) that scores semantic similarity between the RFC title/description and the template description. The "design point — score, threshold, refuse" stays the same; the score function gets dramatically better.
 - **Open Policy Agent (OPA) for rules.** Move the Python rule functions into Rego policies and call out to OPA. You get hot-reloadable policy bundles, decision logging that integrates with the audit log, and the ability to have non-engineers (CAB chairs, compliance officers) own policy files.
-- **Cache invalidation for the graph.** The `_GRAPH` singleton in `relationships.py` is built once and never refreshed. A real system would invalidate on a CMDB-update event, or use a TTL, or both. The doc-note version of this fix is a five-minute job; the implementation requires picking an invalidation strategy.
+- **Cache invalidation for the graph.** The `_GRAPH` singleton in `relationships.py` is built lazily and cached. `relationships.invalidate_graph()` is the explicit invalidation hook — the seam where a real system would attach an event-driven invalidator (e.g. a Kafka subscriber for CMDB updates) or a TTL refresher. The hook is currently called only by tests that swap `config.DATA_DIR` to a synthetic corpus; the production wiring is the upgrade.
 
 ### LLM integration
 
@@ -230,8 +262,8 @@ The list is grouped by what kind of realism each upgrade buys. None are required
 
 ### Evaluation and operations
 
-- **Replay-based regression.** Take a checkpoint of the audit log, then re-run every RFC under a new policy and compare classifications. "After this rule change, 47 RFCs that previously auto-approved would now route to CAB." This is how you sanity-check policy changes before rolling them out.
-- **Eval harness.** A curated set of scenarios with expected outcomes, run on every commit. The seven scenarios in `tests/test_scenarios.py` are the seed of this; a real eval set is hundreds of cases organized by category.
+- **Eval runner.** A tool that classifies a corpus and emits metrics — classification distribution, refusal reasons, per-rule firing counts, decision latency. *(Implemented: `tools/eval.py`, CLI `python -m tools.eval --corpus DIR --out metrics.json --report report.md`. Outputs structured JSON plus a markdown summary.)*
+- **Replay-based regression.** Take a checkpoint of the audit log (or any RFC corpus), then re-run every RFC under a new policy and compare classifications. "After this rule change, 47 RFCs that previously auto-approved would now route to CAB." `tools/eval.py` is the substrate; a `tools/diff.py` that compares two metrics outputs would close the loop.
 - **A/B testing of policy.** Route a fraction of incoming RFCs through a new policy and compare downstream incident rates against the control group. The audit log is the substrate for this analysis.
 - **Drift detection.** Compare the agent's classifications against the CAB's actual decisions over time. If the CAB consistently downgrades the agent's "normal" classifications to "standard" (i.e., they would have auto-approved), the agent is over-cautious and the threshold should move.
 
@@ -258,11 +290,11 @@ The list is grouped by what kind of realism each upgrade buys. None are required
 
 ### Where to start
 
-If you want to pick one upgrade as a course project, the highest-leverage starting points are:
+The data-realism foundation — synthetic data, adversarial inputs, stochastic CMDB drift, eval runner — is already in the lab; see `tools/synth.py`, `tools/eval.py`, and the corresponding test files. The next-highest-leverage starting points for a course project:
 
-1. **Synthetic data generation + eval harness.** Together these turn the agent from a hand-crafted demo into a system you can iterate on with confidence. Most other upgrades depend on having this.
-2. **Embeddings for template matching.** Demonstrates LLM integration cleanly without the full complexity of an LLM-driven harness.
-3. **OPA for rules.** Demonstrates the production pattern of "policy is code, owned by a non-engineering team."
-4. **Replay-based regression.** Shows how the audit log earns its keep — you cannot do this without it.
+1. **Pre-brief generation by an LLM.** The smallest LLM use case in the lab. The structured `_build_pre_brief()` dict already exists; feed it to a constrained-output model and render a one-paragraph CAB summary. The agent's verdict is unchanged — only the wrapper around it gets prose. Cleanest place to introduce the Anthropic SDK and structured outputs without restructuring anything else.
+2. **Embeddings for template matching.** Replace the keyword-overlap `match_template()` with an embedding-similarity scorer. The "score, threshold, refuse" design point stays the same; the score function gets dramatically better. Demonstrates LLM integration without an LLM-driven harness.
+3. **OPA for rules.** Move the Python rule functions in `agent/rules.py` into Rego policies and call out to OPA. Demonstrates the production pattern of "policy is code, owned by a non-engineering team."
+4. **Replay-based regression.** Build `tools/diff.py` that compares two `tools/eval.py` outputs and shows exactly which RFCs changed classification under a new policy. The eval runner already produces the metrics; you just need the diff and a CLI.
 
 Each is two to four weeks of work for a student new to the area, and produces an artifact worth showing.

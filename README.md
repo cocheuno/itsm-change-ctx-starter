@@ -4,6 +4,11 @@ A working reference implementation of the agentic context layer from the ITSM Se
 
 This is a **teaching artifact**, not production code. It uses lightweight libraries so it runs on any laptop without external services.
 
+Two longer companion documents live alongside this one:
+
+- `USAGE.md` — how to run the program, read the output, and use the synthetic-data and eval tools.
+- `AGENT_PRIMER.md` — how the architecture works, written for a student who has heard "AI agent" but has not yet built one. Includes a worked example, a section on how the agent's natural-language output is generated, and a list of upgrades that would make the lab more realistic.
+
 ## What's inside
 
 | Component | Lives in | What it answers |
@@ -15,7 +20,14 @@ This is a **teaching artifact**, not production code. It uses lightweight librar
 | Harness | `agent/harness.py` | The five-step reasoning loop |
 | Types | `agent/types.py` | Documented contracts each layer publishes |
 | Validation | `agent/validation.py` | Enforce schemas at every entity boundary |
-| Config | `agent/config.py` | All thresholds and policy knobs in one place |
+| Config | `agent/config.py` | All thresholds, policy knobs, and the `DATA_DIR` pointer in one place |
+
+## Tools
+
+| Tool | Lives in | What it does |
+|---|---|---|
+| Synthetic data generator | `tools/synth.py` | Generate schema-valid RFCs, services, CMDB with stochastic freshness/confidence drift, plus adversarial variants (malformed RFCs, unknown CIs, prompt-injection pairs). CLI has a `--corpus` mode for full data directories. |
+| Evaluation runner | `tools/eval.py` | Classify a corpus and emit metrics — classification distribution, refusal reasons, per-rule firing counts, decision latency. CLI emits structured JSON and a markdown summary. |
 
 ## Quick start
 
@@ -28,7 +40,11 @@ python classify.py RFC-9920   # Freeze window scenario (planned execution in fre
 python classify.py RFC-9921   # Precedent override scenario
 python classify.py RFC-9922   # Downstream blast radius scenario
 python classify.py RFC-9923   # Submission clean, planned execution in freeze
-pytest -v                     # Run all seven as tests
+pytest -v                     # 36 tests: 7 scenarios + property tests + adversarial + eval
+
+# Generate and evaluate a synthetic corpus
+python -m tools.synth --corpus --services 30 --rfcs 100 --seed 42
+python -m tools.eval  --corpus data/synthetic
 ```
 
 ## The seven scenarios
@@ -56,6 +72,8 @@ All design knobs (confidence thresholds, freshness window, precedent rate, templ
 - Replace JSON files with real systems: Neo4j for the graph, Open Policy Agent for rules, an event store for history.
 - Replace keyword template matching with embeddings.
 - Wire freshness thresholds to real data-pipeline SLAs.
+- Wire `relationships.invalidate_graph()` to a CMDB-update event stream so the cached graph refreshes on change instead of staying static for the process lifetime.
 - Move the kill-switch behind a centralised feature-flag service.
+- Generate the prose pre-brief that goes to CAB with an LLM (the structured pre-brief dict already exists; the model only translates).
 
-See the Worked Example document for the design rationale.
+See `AGENT_PRIMER.md` Part II for the longer list of upgrades, grouped by what kind of realism each one buys.
