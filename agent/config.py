@@ -8,6 +8,13 @@ and history modules.
 Production note: in a real system most of these would be owned by the CAB and
 sourced from a policy service (e.g. OPA bundles), not hard-coded in Python.
 """
+from pathlib import Path
+
+# Where the layer modules read their data from. Tests redirect this to a
+# synthetic corpus by monkeypatching `config.DATA_DIR`; relationships.py
+# also exposes `invalidate_graph()` so the cached CMDB graph rebuilds
+# against the new location.
+DATA_DIR = Path(__file__).parent.parent / "data"
 
 # Relationships layer.
 MIN_EDGE_CONFIDENCE = 0.80

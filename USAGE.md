@@ -138,4 +138,16 @@ python classify.py RFC-1000007
 
 Note: `classify.py` reads from `data/rfcs.json`, not `data/synthetic/rfcs.json`. To run the agent over the synthetic corpus, either copy the entries you want into `data/rfcs.json`, or load and classify them programmatically (see `tests/test_synthetic.py` for an example).
 
-This is Step 1 of the data-realism upgrade roadmap from `AGENT_PRIMER.md`. Future steps add adversarial inputs, stochastic CMDB drift, and an eval-runner that turns the corpus into metrics.
+### Full synthetic corpus (services + CMDB + RFCs)
+
+For larger experiments, `--corpus` generates a complete drop-in replacement for `data/` — services and a CMDB with realistic freshness drift, plus matching RFCs.
+
+```bash
+python -m tools.synth --corpus --services 30 --rfcs 100 --seed 42
+```
+
+This writes to `data/synthetic/`: `services.json`, `cmdb.json`, `rfcs.json`, `event_log.json`, plus copies of the hand-crafted `templates.json` and `freeze_windows.json`. Edge confidence and `last_verified_at` follow realistic distributions (~70% fresh, ~25% borderline straddling the 30-day threshold, ~5% stale; ~80% high confidence, ~5% low). The agent's freshness and confidence rules fire organically across the corpus rather than only on the single hand-crafted RFC-9903.
+
+To run the agent against the synthetic corpus, point `config.DATA_DIR` at it and call `relationships.invalidate_graph()` so the cached CMDB rebuilds — see `tests/test_synthetic_cmdb.py` for the pattern.
+
+This is Step 1+4 of the data-realism upgrade roadmap from `AGENT_PRIMER.md`. The remaining step adds an eval-runner that turns the corpus into metrics.

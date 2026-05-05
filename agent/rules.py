@@ -14,11 +14,8 @@ Here they are Python functions — the structure is what matters.
 """
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from agent import config
 from agent.meaning import all_templates
-
-DATA_DIR = Path(__file__).parent.parent / "data"
 
 # Re-export so existing callers can still read `rules.TEMPLATE_MATCH_THRESHOLD`.
 TEMPLATE_MATCH_THRESHOLD = config.TEMPLATE_MATCH_THRESHOLD
@@ -60,7 +57,7 @@ def check_freeze_window(rfc: dict) -> dict:
     result records `checked_field` and `checked_at` so the trace explains
     exactly which timestamp the rule keyed on.
     """
-    with open(DATA_DIR / "freeze_windows.json") as f:
+    with open(config.DATA_DIR / "freeze_windows.json") as f:
         data = json.load(f)
 
     if rfc.get("planned_start_at"):

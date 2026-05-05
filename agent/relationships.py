@@ -9,17 +9,14 @@ In production this would be Neo4j. Here it is NetworkX loaded from JSON.
 """
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 import networkx as nx
 
 from agent import config
 
-DATA_DIR = Path(__file__).parent.parent / "data"
-
 
 def _build_graph() -> nx.DiGraph:
     """Build the graph from the CMDB snapshot."""
-    with open(DATA_DIR / "cmdb.json") as f:
+    with open(config.DATA_DIR / "cmdb.json") as f:
         cmdb = json.load(f)
 
     G = nx.DiGraph()
@@ -57,6 +54,20 @@ def graph() -> nx.DiGraph:
     if _GRAPH is None:
         _GRAPH = _build_graph()
     return _GRAPH
+
+
+def invalidate_graph() -> None:
+    """
+    Drop the cached graph so the next graph() call rebuilds it.
+
+    Production note: a real CMDB-backed system invalidates via event
+    (a Kafka topic carrying CMDB updates) or TTL, not an explicit hook.
+    This function is the seam where that wiring would attach. Tests
+    use it after monkeypatching `config.DATA_DIR` to a synthetic
+    corpus, so the next classification reads from the new location.
+    """
+    global _GRAPH
+    _GRAPH = None
 
 
 def affected_services(ci_ids: list[str], now: datetime | None = None) -> list[dict]:

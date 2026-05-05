@@ -22,6 +22,7 @@ data problem — the test suite would catch it.
 import argparse
 import json
 import random
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -230,6 +231,212 @@ def generate_prompt_injection_pairs(
     return pairs
 
 
+# ---------- Step 4: stochastic-drift CMDB and full-corpus generators ----------
+
+_SERVICE_NAME_BASES = [
+    "auth-api", "payments-api", "billing-api", "inventory-api",
+    "checkout-api", "search-api", "recommendation-api", "analytics-api",
+    "notifications-api", "user-prefs-api", "session-store", "rate-limiter",
+    "audit-log", "fraud-engine", "kyc-service", "risk-scorer",
+    "marketing-site", "internal-dashboard", "admin-portal", "support-portal",
+    "metrics-collector", "log-aggregator", "config-service", "feature-flag",
+]
+
+_OWNER_TEAMS = [
+    "payments-team", "platform-team", "marketing-eng",
+    "risk-team", "data-eng", "infra-team",
+]
+
+
+def generate_services(n: int, *, seed: int = 0) -> list[dict]:
+    """
+    Generate `n` schema-valid services with realistic tier and DORA mix.
+
+    Roughly 10% critical/DORA, 20% standard, 70% non-critical — a long
+    tail of low-blast-radius services with a small head of regulated
+    ones, which mirrors the shape of a real production catalogue.
+    """
+    rng = random.Random(seed)
+    services = []
+    for i in range(n):
+        roll = rng.random()
+        if roll < 0.10:
+            tier = "critical"
+            dora = True
+        elif roll < 0.30:
+            tier = "standard"
+            dora = False
+        else:
+            tier = "non-critical"
+            dora = False
+
+        base_name = rng.choice(_SERVICE_NAME_BASES)
+        svc = {
+            "id": f"svc-{i:04d}",
+            "name": f"{base_name}-{i:03d}",
+            "tier": tier,
+            "dora_regulated": dora,
+            "owner_team": rng.choice(_OWNER_TEAMS),
+            "last_validated_at": "2026-04-01T10:00:00Z",
+        }
+        validation.validate_service(svc)
+        services.append(svc)
+    return services
+
+
+def generate_cmdb(
+    services: list[dict],
+    *,
+    seed: int = 0,
+    base_date: datetime | None = None,
+    cis_per_service: int = 1,
+    dependency_density: float = 0.10,
+) -> dict:
+    """
+    Generate a CMDB referencing `services` with realistic distributions.
+
+    Edge confidence:
+      ~80% high  (0.85–0.99)
+      ~15% medium (0.70–0.85)
+      ~5%  low   (0.50–0.70)
+
+    Edge freshness (relative to `base_date`):
+      ~70% fresh      (1–25 days old)
+      ~25% borderline (20–35 days old, straddles the 30-day threshold)
+      ~5%  stale      (35–90 days old)
+
+    The borderline band is deliberate — at 30 days exactly, freshness
+    flips. A test corpus that doesn't straddle the threshold can't tell
+    you whether the rule is doing anything.
+    """
+    rng = random.Random(seed + 1)  # offset stream so service and CMDB seeds don't collide
+    if base_date is None:
+        base_date = datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+    cis: list[dict] = []
+    edges: list[dict] = []
+
+    for svc in services:
+        for j in range(cis_per_service):
+            ci_id = f"ci-{svc['id'].removeprefix('svc-')}-{j:02d}"
+            cis.append({
+                "id": ci_id,
+                "type": "certificate",
+                "description": f"Synthetic CI for {svc['name']}",
+            })
+            edges.append({
+                "ci_id": ci_id,
+                "service_id": svc["id"],
+                "confidence": _draw_confidence(rng),
+                "last_verified": _draw_freshness(rng, base_date),
+            })
+
+    deps: list[dict] = []
+    n_deps = max(1, int(len(services) * dependency_density))
+    for _ in range(n_deps):
+        a, b = rng.sample(services, 2)
+        deps.append({
+            "from": a["id"],
+            "to": b["id"],
+            "confidence": round(rng.uniform(0.70, 0.95), 2),
+            "description": f"{a['name']} depends on {b['name']}",
+        })
+
+    return {
+        "cis": cis,
+        "ci_service_edges": edges,
+        "service_dependencies": deps,
+    }
+
+
+def _draw_confidence(rng: random.Random) -> float:
+    r = rng.random()
+    if r < 0.80:
+        return round(rng.uniform(0.85, 0.99), 2)
+    if r < 0.95:
+        return round(rng.uniform(0.70, 0.85), 2)
+    return round(rng.uniform(0.50, 0.70), 2)
+
+
+def _draw_freshness(rng: random.Random, base_date: datetime) -> str:
+    r = rng.random()
+    if r < 0.70:
+        days_old = rng.uniform(1, 25)
+    elif r < 0.95:
+        days_old = rng.uniform(20, 35)
+    else:
+        days_old = rng.uniform(35, 90)
+    return _isoformat(base_date - timedelta(days=days_old))
+
+
+def generate_synthetic_corpus(
+    out_dir: Path,
+    *,
+    seed: int = 0,
+    n_services: int = 30,
+    n_rfcs: int = 100,
+    cis_per_service: int = 1,
+    base_date: datetime | None = None,
+) -> dict:
+    """
+    Write a complete synthetic corpus to `out_dir` so it is a drop-in
+    replacement for `data/`. Generated files:
+
+      services.json       — synthetic
+      cmdb.json           — synthetic, with stochastic freshness/confidence drift
+      rfcs.json           — synthetic, referencing the synthetic CMDB
+      event_log.json      — empty (synthetic precedent generation is later)
+      templates.json      — copied from `data/`
+      freeze_windows.json — copied from `data/`
+
+    Returns a summary dict with the seed and counts so callers (CLI,
+    tests) can log what they got.
+    """
+    if base_date is None:
+        base_date = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    services = generate_services(n_services, seed=seed)
+    _write_json(out_dir / "services.json", {"services": services})
+
+    cmdb = generate_cmdb(
+        services,
+        seed=seed,
+        base_date=base_date,
+        cis_per_service=cis_per_service,
+    )
+    _write_json(out_dir / "cmdb.json", cmdb)
+
+    rfcs = generate_rfcs(
+        n_rfcs,
+        seed=seed,
+        cmdb_path=out_dir / "cmdb.json",
+        base_date=base_date,
+    )
+    _write_json(out_dir / "rfcs.json", {"rfcs": rfcs})
+
+    _write_json(out_dir / "event_log.json", {"events": []})
+
+    src = ROOT_DIR / "data"
+    shutil.copy(src / "templates.json", out_dir / "templates.json")
+    shutil.copy(src / "freeze_windows.json", out_dir / "freeze_windows.json")
+
+    return {
+        "seed": seed,
+        "n_services": len(services),
+        "n_cis": len(cmdb["cis"]),
+        "n_edges": len(cmdb["ci_service_edges"]),
+        "n_dependencies": len(cmdb["service_dependencies"]),
+        "n_rfcs": len(rfcs),
+        "out_dir": str(out_dir),
+    }
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
 def generate_malformed_rfcs() -> list[tuple[dict, str]]:
     """
     Deliberate schema violations. Each tuple is (rfc, kind) — the kind
@@ -264,27 +471,65 @@ def generate_malformed_rfcs() -> list[tuple[dict, str]]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Generate a synthetic RFC corpus that references the existing CMDB."
+        description=(
+            "Generate synthetic data for the change-management agent. "
+            "Default mode produces RFCs against the existing CMDB; "
+            "`--corpus` produces a full data directory (services, CMDB, "
+            "RFCs, event log) with stochastic freshness drift."
+        )
     )
-    parser.add_argument("--rfcs", type=int, default=50, help="number of RFCs to generate")
+    parser.add_argument(
+        "--corpus",
+        action="store_true",
+        help="generate a full synthetic corpus instead of just RFCs",
+    )
+    parser.add_argument("--rfcs", type=int, default=None, help="number of RFCs (default 50 / 100 in corpus mode)")
     parser.add_argument("--seed", type=int, default=0, help="random seed")
     parser.add_argument(
         "--out",
         type=Path,
-        default=DEFAULT_OUT_PATH,
-        help="output path (default data/synthetic/rfcs.json)",
+        default=None,
+        help="output path: RFCs file (default mode) or corpus directory (--corpus)",
     )
     parser.add_argument(
         "--cmdb",
         type=Path,
         default=DEFAULT_CMDB_PATH,
-        help="CMDB to draw CIs from (default data/cmdb.json)",
+        help="CMDB to draw CIs from (default mode only)",
+    )
+    parser.add_argument(
+        "--services",
+        type=int,
+        default=30,
+        help="number of synthetic services (--corpus only)",
+    )
+    parser.add_argument(
+        "--cis-per-service",
+        type=int,
+        default=1,
+        help="CIs per service (--corpus only)",
     )
     args = parser.parse_args(argv)
 
-    rfcs = generate_rfcs(args.rfcs, seed=args.seed, cmdb_path=args.cmdb)
-    write_rfcs(rfcs, args.out)
-    print(f"Wrote {len(rfcs)} RFCs to {args.out} (seed {args.seed})")
+    if args.corpus:
+        out = args.out or (ROOT_DIR / "data" / "synthetic")
+        summary = generate_synthetic_corpus(
+            out,
+            seed=args.seed,
+            n_services=args.services,
+            n_rfcs=args.rfcs if args.rfcs is not None else 100,
+            cis_per_service=args.cis_per_service,
+        )
+        print(f"Wrote synthetic corpus to {summary['out_dir']} (seed {args.seed})")
+        for k, v in summary.items():
+            if k not in {"out_dir", "seed"}:
+                print(f"  {k}: {v}")
+    else:
+        out = args.out or DEFAULT_OUT_PATH
+        n_rfcs = args.rfcs if args.rfcs is not None else 50
+        rfcs = generate_rfcs(n_rfcs, seed=args.seed, cmdb_path=args.cmdb)
+        write_rfcs(rfcs, out)
+        print(f"Wrote {len(rfcs)} RFCs to {out} (seed {args.seed})")
     return 0
 
 

@@ -8,16 +8,13 @@ In a production system this would sit behind a semantic layer or business
 glossary service. Here it is backed by simple JSON files.
 """
 import json
-from pathlib import Path
 from typing import Optional
 
-from agent import validation
-
-DATA_DIR = Path(__file__).parent.parent / "data"
+from agent import config, validation
 
 
 def _load_services() -> list[dict]:
-    with open(DATA_DIR / "services.json") as f:
+    with open(config.DATA_DIR / "services.json") as f:
         services = json.load(f)["services"]
     for svc in services:
         validation.validate_service(svc)
@@ -25,7 +22,7 @@ def _load_services() -> list[dict]:
 
 
 def _load_templates() -> list[dict]:
-    with open(DATA_DIR / "templates.json") as f:
+    with open(config.DATA_DIR / "templates.json") as f:
         templates = json.load(f)["templates"]
     for tpl in templates:
         validation.validate_template(tpl)

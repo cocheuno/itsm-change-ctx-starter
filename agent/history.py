@@ -7,13 +7,12 @@ template match plus a clean history of 10 prior successes is much stronger evide
 than a template match alone.
 """
 import json
-from pathlib import Path
 
-DATA_DIR = Path(__file__).parent.parent / "data"
+from agent import config
 
 
 def _load_events() -> list[dict]:
-    with open(DATA_DIR / "event_log.json") as f:
+    with open(config.DATA_DIR / "event_log.json") as f:
         return json.load(f)["events"]
 
 
