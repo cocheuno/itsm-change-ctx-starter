@@ -150,4 +150,32 @@ This writes to `data/synthetic/`: `services.json`, `cmdb.json`, `rfcs.json`, `ev
 
 To run the agent against the synthetic corpus, point `config.DATA_DIR` at it and call `relationships.invalidate_graph()` so the cached CMDB rebuilds — see `tests/test_synthetic_cmdb.py` for the pattern.
 
-This is Step 1+4 of the data-realism upgrade roadmap from `AGENT_PRIMER.md`. The remaining step adds an eval-runner that turns the corpus into metrics.
+This is Step 1+4 of the data-realism upgrade roadmap from `AGENT_PRIMER.md`.
+
+## 10. Evaluate the agent over a corpus
+
+`tools/eval.py` runs the agent over a corpus directory and emits metrics: classification distribution, refusal reason breakdown, per-rule firing counts, and decision latency.
+
+```bash
+python -m tools.eval --corpus data/synthetic
+```
+
+Flags:
+
+- `--corpus DIR` — corpus directory in the same shape as `data/` (default `data/synthetic`)
+- `--out PATH` — write structured metrics as JSON to this path
+- `--report PATH` — write the markdown summary to this path
+
+By default, eval runs do **not** write to the agent's audit log — pollution of `data/audit_log.jsonl` with eval-run noise would corrupt the very signal it exists to provide.
+
+`run_eval()` is also importable directly. It uses a context manager that restores `config.DATA_DIR` and the relationships graph cache on exit, so the rest of the program is unaffected by the redirect.
+
+Running eval against the hand-crafted seven-scenario corpus is a quick health check that the documented outcomes still hold:
+
+```bash
+python -m tools.eval --corpus data
+```
+
+Expected: 1 standard, 5 normal, 1 emergency, 1 refused. If those numbers change, either a scenario broke or a policy rule shifted — both worth investigating.
+
+This is Step 5 of the data-realism upgrade roadmap. It is the seed of every later upgrade — replay-based regression, A/B testing of policy changes, drift detection between agent and CAB. None of those are possible without first being able to ask "what does the agent do over a representative corpus?"
